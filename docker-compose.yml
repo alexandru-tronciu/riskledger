@@ -20,6 +20,7 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://riskledger:riskledger@postgres:5432/airflow_meta
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "riskledger_dev_secret_change_in_production"
     entrypoint: /bin/bash
     command:
       - -c
@@ -36,6 +37,8 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://riskledger:riskledger@postgres:5432/airflow_meta
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAG_DIR_LIST_INTERVAL: "10"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "riskledger_dev_secret_change_in_production"
     ports:
       - "8090:8080"
     volumes:
@@ -51,6 +54,7 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://riskledger:riskledger@postgres:5432/airflow_meta
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "riskledger_dev_secret_change_in_production"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
     command: scheduler
