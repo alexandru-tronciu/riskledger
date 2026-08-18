@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: riskledger
+    schema: public
+    tables:
+      - name: transactions
+      - name: accounts
