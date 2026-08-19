@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: fact_transactions
+    columns:
+      - name: transaction_id
+        tests:
+          - unique
+          - not_null
+      - name: account_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_account')
+                field: account_id
+      - name: amount
+        tests:
+          - not_null
+
+  - name: dim_account
+    columns:
+      - name: account_id
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_employee
+    columns:
+      - name: employee_id
+        tests:
+          - unique
+          - not_null
