@@ -2,26 +2,27 @@
 
 A data engineering pipeline built around a synthetic bank: transaction
 volume at a scale that actually stresses the database, an Airflow
-scheduler that runs on its own instead of being triggered by hand, and a
-dbt layer that turns raw operational tables into something a compliance
-analyst could actually query. The end goal is a system that flags
-suspicious activity automatically — duplicate approvals, unusual volume
-on an account, that kind of thing — but that part isn't built yet. This
-README describes what's actually running today, not the full plan.
+scheduler that runs on its own instead of being triggered by hand, a dbt
+layer that turns raw operational tables into something a compliance
+analyst could actually query, a statistical rule that flags unusual
+activity automatically, and a Grafana dashboard that surfaces it.
 
-## Status: in progress
+![Pipeline architecture](docs/pipeline-architecture.svg)
 
-I'm building this in layers, and I'd rather commit each layer once it
-works than sit on everything until the whole thing is "done." Right now:
+## Status: complete
 
-- **Data generation** — done. 10k accounts, 2M transactions, partitioned
-  by year.
-- **Orchestration (Airflow)** — done for the basic case. One working DAG.
-- **Transformation (dbt)** — the core star schema exists and runs, but
-  there are no dbt tests yet and the audit-log integration (see below)
-  isn't wired in.
-- **Anomaly detection** — not started.
-- **Dashboards / access control** — not started.
+All five layers are built and wired together:
+
+- **Data generation** — 10k accounts, 2M transactions, partitioned by year.
+- **Orchestration (Airflow)** — two DAGs: one that checks data freshness,
+  one that runs the dbt pipeline (`dbt run` → `dbt test`) on a schedule.
+- **Transformation (dbt)** — staging models plus a star schema
+  (`fact_transactions`, `dim_account`, `dim_employee`, `dim_date`), with
+  9 passing data tests (uniqueness, not-null, referential integrity).
+- **Anomaly detection** — a 3-sigma rule on daily transaction volume per
+  employee, materialized as `fact_risk_flags`.
+- **Dashboards & access** — a Grafana dashboard on top of the mart, plus
+  a viewer-role account so not everyone who touches this has edit rights.
 
 ## Why it's structured this way
 
@@ -33,17 +34,31 @@ against `transactions` means rewriting the same joins and date logic
 every time. dbt exists here to do that reshaping once: `stg_transactions`
 and `stg_accounts` are thin pass-throughs over the raw tables, and
 `fact_transactions` / `dim_account` / `dim_employee` / `dim_date` are the
-star-schema layer built on top of them. Once that layer exists, a
-question like "top 5 employees by transaction count this month" is a
-two-table join instead of a wall of `EXTRACT()` calls.
+star-schema layer built on top of them.
 
-Airflow's job here is narrower than it sounds — right now it runs one
-DAG (`check_data_freshness`) that just confirms the transaction count
-looks sane. That's intentionally the smallest useful thing: prove the
-scheduler can talk to Postgres across the Docker network before building
-anything that depends on it. The next DAG will actually call `dbt run`
-on a schedule instead of me running it by hand, which is the point where
-Airflow starts pulling its weight.
+Airflow's first job here was narrow on purpose — a single DAG
+(`check_data_freshness`) that just confirms the transaction count looks
+sane, to prove the scheduler could talk to Postgres across the Docker
+network before anything depended on it. The second DAG,
+`run_dbt_pipeline`, is where Airflow actually earns its place: it runs
+`dbt run` and then `dbt test` on a schedule, with `dbt_test` only firing
+if `dbt_run` succeeds — the same dependency Airflow is built around,
+just applied to a transformation job instead of a Python function.
+
+## The anomaly rule
+
+`fact_risk_flags` computes, per employee, the average and standard
+deviation of daily transaction count, then flags any day where that
+count is more than three standard deviations above the mean — the
+standard 3-sigma threshold, which on a roughly normal distribution
+should only ever catch genuine outliers, not a slightly busier Tuesday.
+
+On the generated data (uniform random, no real anomalies) this correctly
+flags nothing. To confirm the rule actually works rather than just
+compiling, I inserted 500 extra transactions for a single employee on a
+single day and re-ran the model — it caught it immediately:
+
+![Anomaly detected in terminal](docs/anomaly-detection-terminal.png)
 
 ## Two things that went wrong and why they're worth mentioning
 
@@ -56,13 +71,25 @@ the scheduler logs pointed at this; the fix was setting
 `AIRFLOW__WEBSERVER__SECRET_KEY` to the same literal string across all
 three Airflow services in the compose file.
 
-**Port 8081 silently refused connections on this machine** — no
-firewall error, no useful message, just `ERR_EMPTY_RESPONSE` in the
-browser even though `docker ps` showed the port mapped and the
-container's own logs showed Gunicorn listening fine. Moved the webserver
-to 8090 and it worked immediately. I never found the actual cause (some
-other local service probably has a soft claim on 8081); noting it here
-in case it happens again.
+**dbt isn't in the base Airflow image.** The official `apache/airflow`
+image doesn't ship dbt, and `pip install` inside a running container
+fails with a permissions error because Airflow runs as a non-root user.
+The actual fix was a small custom image (`Dockerfile.airflow`) that
+installs `dbt-postgres` as the `airflow` user at build time, referenced
+from `docker-compose.yml` with `build:` instead of `image:` on all three
+Airflow services.
+
+## What it looks like running
+
+`run_dbt_pipeline` in Airflow — `dbt_run` succeeding, `dbt_test` only
+starting once it does:
+
+![Airflow DAG success](docs/airflow-dag-success.png)
+
+The same risk flag, in Grafana, next to the daily volume graph that
+shows exactly why it fired:
+
+![Grafana dashboard: Risk Alerts and Daily Volume](docs/grafana-dashboard.png)
 
 ## Running it
 
@@ -70,13 +97,14 @@ in case it happens again.
 docker compose up -d
 ```
 
-Brings up Postgres, Airflow (init/webserver/scheduler), on ports 5435
-and 8090.
+Builds a custom Airflow image (dbt included) and brings up Postgres,
+Airflow (init/webserver/scheduler), and Grafana. Ports: 5435 (Postgres),
+8090 (Airflow), 3002 (Grafana).
 
 ```
 python -m venv venv
 venv\Scripts\activate
-pip install -r requirements.txt   # psycopg2-binary, faker, dbt-postgres
+pip install psycopg2-binary faker dbt-postgres
 python scripts/generate_transactions.py
 ```
 
@@ -86,13 +114,15 @@ couple of minutes for 2M rows.
 ```
 cd dbt_project
 dbt run
+dbt test
 ```
 
-Builds the staging and mart models. Everything is a view for now — no
-reason to materialize as tables yet at this volume.
+Builds every model and runs the 9 data tests. Or let Airflow do it:
+`run_dbt_pipeline` in the UI runs the same two commands on a schedule.
 
-Airflow UI: `http://127.0.0.1:8090`, admin/admin (set in compose, no
-manual signup).
+Airflow UI: `http://127.0.0.1:8090`, admin/admin (set in compose).
+Grafana: `http://localhost:3002`, admin/admin on first login (you'll be
+asked to change it).
 
 ## A query the star schema was built for
 
@@ -107,30 +137,27 @@ ORDER BY total DESC;
 Against raw `transactions` this needs a `GROUP BY` on a text column with
 no index backing it. Against the mart it's instant.
 
-## What's next, roughly in order
-
-1. dbt tests on the mart layer — no negative amounts without a flag, no
-   orphaned `account_id` values, that kind of thing.
-2. Pull in `dbaudit`'s `audit_history` table as a second fact table
-   (`fact_audit_events`) so schema changes and data changes live in the
-   same model, not just transaction volume.
-3. An anomaly job — segregation-of-duties checks (same employee
-   creating and approving) and basic volume outliers — run as an Airflow
-   task on a schedule, writing into a `fact_risk_flags` table.
-4. Grafana on top of the mart, plus a thin access layer so not everyone
-   sees everything.
-
 ## Layout
 
 ```
 riskledger/
-├── docker-compose.yml       # Postgres + Airflow
+├── docker-compose.yml
+├── Dockerfile.airflow        # apache/airflow + dbt-postgres
+├── dbt_profiles/
+│   └── profiles.yml          # container-side dbt connection (host: postgres)
+├── docs/                      # diagrams and screenshots referenced above
 ├── scripts/
 │   └── generate_transactions.py
 ├── airflow/dags/
-│   └── check_data_freshness.py
+│   ├── check_data_freshness.py
+│   └── run_dbt_pipeline.py   # dbt run -> dbt test, scheduled
 └── dbt_project/
     └── models/
-        ├── staging/          # stg_transactions, stg_accounts
-        └── marts/            # dim_account, dim_date, dim_employee, fact_transactions
+        ├── staging/           # stg_transactions, stg_accounts
+        └── marts/             # dim_account, dim_date, dim_employee,
+                                # fact_transactions, fact_risk_flags
 ```
+
+## License
+
+MIT
